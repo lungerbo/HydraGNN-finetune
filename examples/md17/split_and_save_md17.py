@@ -1,9 +1,16 @@
 import os
+import json
 import torch
 import random
 import torch_geometric
-from torch_geometric.transforms import AddLaplacianEigenvectorPE
+
 import hydragnn
+
+def md17_pre_transform(data):
+    data.x = data.z.float().view(-1, 1)
+    data.y = data.energy / len(data.x)
+    data = compute_edges(data)
+    return data
 
 def split_dataset(dataset, perc_train=0.7, perc_val=0.15, seed=0):
     num_samples = len(dataset)
@@ -34,44 +41,32 @@ def save_split(dataset, filename):
 def load_split(filename):
     return torch.load(filename)
 
-def md17_pre_transform(data, compute_edges, transform):
-    data.x = data.z.float().view(-1, 1)
-    data.y = data.energy / len(data.x)
-    data = compute_edges(data)
-    data = transform(data)
-    source_pe = data.pe[data.edge_index[0]]
-    target_pe = data.pe[data.edge_index[1]]
-    data.rel_pe = torch.abs(source_pe - target_pe)
-    return data
-
 if __name__ == "__main__":
-    # Parameters
-    molecule = "uracil"  # change if you want other MD17 molecules
-    arch_config = {
-        "radius": 7,
-        "max_neighbours": 5,
-        "pe_dim": 6
-    }
-    perc_train = 0.7
+    # Load config
+    filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), "md17.json")
+    with open(filename, "r") as f:
+        config = json.load(f)
+    perc_train = config["NeuralNetwork"]["Training"].get("perc_train", 0.7)
     perc_val = 0.15
     seed = 42
     fractions = [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
-    out_dir = f"md17_splits_{molecule}"
+    out_dir = "md17_splits"
     os.makedirs(out_dir, exist_ok=True)
 
+    # Setup
+    arch_config = config["NeuralNetwork"]["Architecture"]
     compute_edges = hydragnn.preprocess.get_radius_graph_config(arch_config)
-    transform = AddLaplacianEigenvectorPE(
-        k=arch_config["pe_dim"], attr_name="pe", is_undirected=True
-    )
 
-    torch_geometric.datasets.MD17.file_names[molecule] = f"md17_{molecule}.npz"
+    # Fix for MD17 dataset (Uracil)
+    torch_geometric.datasets.MD17.file_names["uracil"] = "md17_uracil.npz"
     dataset = torch_geometric.datasets.MD17(
         root="dataset/md17",
-        name=molecule,
-        pre_transform=lambda data: md17_pre_transform(data, compute_edges, transform),
-        pre_filter=None,  # No filter: use all data
+        name="uracil",
+        pre_transform=md17_pre_transform,
+        pre_filter=None,  # Use full dataset
     )
 
+    # Split
     train_set, val_set, test_set = split_dataset(dataset, perc_train=perc_train, perc_val=perc_val, seed=seed)
     print(f"Full train: {len(train_set)}, val: {len(val_set)}, test: {len(test_set)}")
 
@@ -85,5 +80,3 @@ if __name__ == "__main__":
         sub_train = subsample_train(train_set, frac, seed=seed)
         save_split(sub_train, os.path.join(out_dir, f"train_{int(frac*100)}.pt"))
         print(f"Train fraction {frac}: {len(sub_train)} samples saved to train_{int(frac*100)}.pt")
-
-    print("All splits saved. To load: use torch.load(filename)")
