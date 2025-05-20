@@ -1,10 +1,29 @@
 import os
+import json
 import torch
 import random
 import torch_geometric
-from torch_geometric.transforms import AddLaplacianEigenvectorPE
+
 import hydragnn
 
+# --- Pre-transform and settings from your 2024 script ---
+def qm9_pre_transform(data):
+    data.x = data.z.float().view(-1, 1)
+    data.y = data.y[:, 10] / len(data.x)
+    return data
+
+# Set this path for output.
+try:
+    os.environ["SERIALIZED_DATA_PATH"]
+except:
+    os.environ["SERIALIZED_DATA_PATH"] = os.getcwd()
+
+# Configurable run choices
+filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qm9.json")
+with open(filename, "r") as f:
+    config = json.load(f)
+
+# --- Splitting, subsampling, and saving utilities ---
 def split_dataset(dataset, perc_train=0.7, perc_val=0.15, seed=0):
     num_samples = len(dataset)
     indices = list(range(num_samples))
@@ -14,8 +33,8 @@ def split_dataset(dataset, perc_train=0.7, perc_val=0.15, seed=0):
     n_val = int(perc_val * num_samples)
     n_test = num_samples - n_train - n_val
     train_idx = indices[:n_train]
-    val_idx = indices[n_train:n_train + n_val]
-    test_idx = indices[n_train + n_val:]
+    val_idx = indices[n_train:n_train+n_val]
+    test_idx = indices[n_train+n_val:]
     train_set = [dataset[i] for i in train_idx]
     val_set = [dataset[i] for i in val_idx]
     test_set = [dataset[i] for i in test_idx]
@@ -34,35 +53,19 @@ def save_split(dataset, filename):
 def load_split(filename):
     return torch.load(filename)
 
-def qm9_pre_transform(data, transform):
-    data = transform(data)
-    data.x = data.z.float().view(-1, 1)
-    data.y = data.y[:, 10] / len(data.x)
-    source_pe = data.pe[data.edge_index[0]]
-    target_pe = data.pe[data.edge_index[1]]
-    data.rel_pe = torch.abs(source_pe - target_pe)
-    return data
-
 if __name__ == "__main__":
-    arch_config = {
-        "pe_dim": 2
-    }
-    perc_train = 0.7
+    perc_train = config["NeuralNetwork"]["Training"].get("perc_train", 0.7)
     perc_val = 0.15
     seed = 42
     fractions = [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
     out_dir = "qm9_splits"
     os.makedirs(out_dir, exist_ok=True)
 
-    transform = AddLaplacianEigenvectorPE(
-        k=arch_config["pe_dim"], attr_name="pe", is_undirected=True
+    # Remove any pre_filter for using the full dataset!
+    dataset = torch_geometric.datasets.QM9(
+        root="dataset/qm9", pre_transform=qm9_pre_transform, pre_filter=None
     )
 
-    dataset = torch_geometric.datasets.QM9(
-        root="dataset/qm9",
-        pre_transform=lambda data: qm9_pre_transform(data, transform),
-        pre_filter=None,  # No filter: use all data
-    )
     train_set, val_set, test_set = split_dataset(dataset, perc_train=perc_train, perc_val=perc_val, seed=seed)
     print(f"Full train: {len(train_set)}, val: {len(val_set)}, test: {len(test_set)}")
 
@@ -76,4 +79,3 @@ if __name__ == "__main__":
         sub_train = subsample_train(train_set, frac, seed=seed)
         save_split(sub_train, os.path.join(out_dir, f"train_{int(frac*100)}.pt"))
         print(f"Train fraction {frac}: {len(sub_train)} samples saved to train_{int(frac*100)}.pt")
-
