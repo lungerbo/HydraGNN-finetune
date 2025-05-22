@@ -1,81 +1,66 @@
 import os
-import json
 import torch
 import random
-import torch_geometric
+from torch_geometric.datasets import QM9
+from torch_geometric.nn import radius_graph
 
-import hydragnn
-
-# --- Pre-transform and settings from your 2024 script ---
 def qm9_pre_transform(data):
-    data.x = data.z.float().view(-1, 1)
+    # Node features: [atomic_number, x, y, z]
+    atomic_number = data.z.view(-1, 1).float()
+    coordinates = data.pos.float()
+    data.x = torch.cat([atomic_number, coordinates], dim=1)  # shape: [num_nodes, 4]
+
+    # Label: free energy / U0 normalized by atom count
     data.y = data.y[:, 10] / len(data.x)
+
+    # Edge index and edge length
+    edge_index = radius_graph(coordinates, r=5.0, loop=False)
+    row, col = edge_index
+    edge_vec = coordinates[row] - coordinates[col]
+    edge_length = torch.norm(edge_vec, dim=1, keepdim=True)
+    data.edge_index = edge_index
+    data.edge_attr = edge_length
+
     return data
 
-# Set this path for output.
-try:
-    os.environ["SERIALIZED_DATA_PATH"]
-except:
-    os.environ["SERIALIZED_DATA_PATH"] = os.getcwd()
-
-# Configurable run choices
-filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qm9.json")
-with open(filename, "r") as f:
-    config = json.load(f)
-
-# --- Splitting, subsampling, and saving utilities ---
-def split_dataset(dataset, perc_train=0.7, perc_val=0.15, seed=0):
-    num_samples = len(dataset)
-    indices = list(range(num_samples))
+def split_dataset(dataset, perc_train=0.7, perc_val=0.15, seed=42):
+    indices = list(range(len(dataset)))
     random.seed(seed)
     random.shuffle(indices)
-    n_train = int(perc_train * num_samples)
-    n_val = int(perc_val * num_samples)
-    n_test = num_samples - n_train - n_val
+    n_train = int(perc_train * len(dataset))
+    n_val = int(perc_val * len(dataset))
     train_idx = indices[:n_train]
     val_idx = indices[n_train:n_train+n_val]
     test_idx = indices[n_train+n_val:]
-    train_set = [dataset[i] for i in train_idx]
-    val_set = [dataset[i] for i in val_idx]
-    test_set = [dataset[i] for i in test_idx]
-    return train_set, val_set, test_set
+    return [dataset[i] for i in train_idx], [dataset[i] for i in val_idx], [dataset[i] for i in test_idx]
 
-def subsample_train(train_set, fraction, seed=0):
-    num_samples = len(train_set)
-    num_sub = max(1, int(fraction * num_samples))
+def subsample_train(train_set, fraction, seed=42):
+    n = max(1, int(len(train_set) * fraction))
     random.seed(seed)
-    indices = random.sample(range(num_samples), num_sub)
+    indices = random.sample(range(len(train_set)), n)
     return [train_set[i] for i in indices]
 
-def save_split(dataset, filename):
-    torch.save(dataset, filename)
-
-def load_split(filename):
-    return torch.load(filename)
+def save_split(dataset, path):
+    torch.save(dataset, path)
 
 if __name__ == "__main__":
-    perc_train = config["NeuralNetwork"]["Training"].get("perc_train", 0.7)
-    perc_val = 0.15
-    seed = 42
-    fractions = [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
-    out_dir = "qm9_splits"
-    os.makedirs(out_dir, exist_ok=True)
+    if os.path.exists("dataset/qm9/processed"):
+        print("  Removing old processed data to apply updated pre_transform...")
+        import shutil
+        shutil.rmtree("dataset/qm9/processed")
 
-    # Remove any pre_filter for using the full dataset!
-    dataset = torch_geometric.datasets.QM9(
-        root="dataset/qm9", pre_transform=qm9_pre_transform, pre_filter=None
-    )
+    dataset = QM9(root="dataset/qm9", pre_transform=qm9_pre_transform)
+    train_set, val_set, test_set = split_dataset(dataset, perc_train=0.7, perc_val=0.15, seed=42)
 
-    train_set, val_set, test_set = split_dataset(dataset, perc_train=perc_train, perc_val=perc_val, seed=seed)
-    print(f"Full train: {len(train_set)}, val: {len(val_set)}, test: {len(test_set)}")
+    os.makedirs("qm9_splits", exist_ok=True)
+    save_split(train_set, "qm9_splits/train_full.pt")
+    save_split(val_set, "qm9_splits/val.pt")
+    save_split(test_set, "qm9_splits/test.pt")
 
-    # Save full splits
-    save_split(train_set, os.path.join(out_dir, "train_full.pt"))
-    save_split(val_set, os.path.join(out_dir, "val.pt"))
-    save_split(test_set, os.path.join(out_dir, "test.pt"))
+    for frac in [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]:
+        tag = str(int(frac * 100))
+        sub = subsample_train(train_set, frac)
+        save_split(sub, f"qm9_splits/train_{tag}.pt")
+        print(f" Saved train_{tag}.pt ({len(sub)} samples)")
 
-    # Save fraction subsamples of the training set
-    for frac in fractions:
-        sub_train = subsample_train(train_set, frac, seed=seed)
-        save_split(sub_train, os.path.join(out_dir, f"train_{int(frac*100)}.pt"))
-        print(f"Train fraction {frac}: {len(sub_train)} samples saved to train_{int(frac*100)}.pt")
+    print(" All QM9 splits written to qm9_splits/")
