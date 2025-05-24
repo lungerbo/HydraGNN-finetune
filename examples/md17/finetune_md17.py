@@ -2,8 +2,8 @@ import os
 import json
 import torch
 import numpy as np
-from torch_geometric.loader import DataLoader
 from collections import OrderedDict
+from torch_geometric.loader import DataLoader
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score, mean_absolute_error
 import hydragnn
@@ -26,7 +26,7 @@ val_set = torch.load(os.path.join(split_dir, "val.pt"))
 test_set = torch.load(os.path.join(split_dir, "test.pt"))
 print(f"Loaded split: train_{train_fraction}.pt ({len(train_set)}), val ({len(val_set)}), test ({len(test_set)})")
 
-# --- GFM-style baseline normalization ---
+# --- GFM-style linear baseline (used for residual training) ---
 all_splits = [train_set, val_set, test_set]
 all_elements = sorted({int(z) for split in all_splits for g in split for z in g.z.tolist()})
 element_to_idx = {z: i for i, z in enumerate(all_elements)}
@@ -41,18 +41,19 @@ X_train = np.stack([get_element_fractions(g) for g in train_set])
 y_train = np.array([g.y.item() for g in train_set])
 reg = LinearRegression().fit(X_train, y_train)
 
+# --- Subtract baseline for training (residual prediction) ---
 for split in all_splits:
     for g in split:
         baseline = reg.predict(get_element_fractions(g).reshape(1, -1))[0]
         g.y = torch.tensor(g.y.item() - baseline, dtype=torch.float32)
-print("Applied GFM-style linear baseline normalization to all splits.")
+print("Applied GFM-style linear baseline subtraction (residual training).")
 
 # --- Dataloaders ---
 train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_set, batch_size=batch_size)
 test_loader = DataLoader(test_set, batch_size=batch_size)
 
-# --- Initialize Distributed Training ---
+# --- Setup ---
 os.environ.setdefault("SERIALIZED_DATA_PATH", os.getcwd())
 world_size, world_rank = hydragnn.utils.distributed.setup_ddp()
 log_name = f"md17_gfm_{train_fraction}"
@@ -62,7 +63,7 @@ hydragnn.utils.update_config(config, train_loader, val_loader, test_loader)
 model = hydragnn.models.create_model_config(config=config["NeuralNetwork"], verbosity=verbosity)
 model = hydragnn.utils.get_distributed_model(model, verbosity)
 
-# --- Load checkpoint ---
+# --- Load GFM checkpoint ---
 def strip_module_prefix(state_dict):
     return OrderedDict((k[7:] if k.startswith("module.") else k, v) for k, v in state_dict.items())
 
@@ -73,23 +74,19 @@ if os.path.isfile(checkpoint_path):
         load_result = model.load_state_dict(state_dict, strict=False)
     except RuntimeError:
         load_result = model.load_state_dict(strip_module_prefix(state_dict), strict=False)
-
     print(f"Loaded GFM checkpoint from {checkpoint_path}")
     print(f"Missing keys: {load_result.missing_keys}")
     print(f"Unexpected keys: {load_result.unexpected_keys}")
-
-    key = "graph_convs.0.module_0.edge_mlp.0.weight"
-    if key in model.state_dict():
-        print("Conv layer (model):", model.state_dict()[key].view(-1)[:5])
 else:
     raise FileNotFoundError(f"No GFM checkpoint found at {checkpoint_path}")
 
-# --- Optimizer & Trainer ---
+# --- Optimizer & Scheduler ---
 optimizer = torch.optim.AdamW(model.parameters(), lr=config["NeuralNetwork"]["Training"]["Optimizer"]["learning_rate"])
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-5)
 writer = hydragnn.utils.get_summary_writer(log_name)
 hydragnn.utils.save_config(config, log_name)
 
+# --- Training ---
 hydragnn.train.train_validate_test(
     model,
     optimizer,
@@ -104,9 +101,10 @@ hydragnn.train.train_validate_test(
     create_plots=config["Visualization"]["create_plots"],
 )
 
-# --- Evaluation ---
+# --- Evaluation (add baseline back) ---
 model.eval()
 y_true, y_pred = [], []
+
 with torch.no_grad():
     for batch in test_loader:
         batch = batch.to(model.device)
@@ -122,8 +120,15 @@ with torch.no_grad():
 y_true = np.concatenate(y_true)
 y_pred = np.concatenate(y_pred)
 
-print(f"GFM (energy, normalized): R2 Score: {r2_score(y_true, y_pred):.4f}, MAE: {mean_absolute_error(y_true, y_pred):.4f}")
+# --- Add baseline back to get total energy predictions ---
+X_test = np.stack([get_element_fractions(g) for g in test_set])
+baseline_test = reg.predict(X_test)
 
-# --- Optional cleanup ---
+y_true_total = y_true + baseline_test
+y_pred_total = y_pred + baseline_test
+
+print(f"GFM (total energy): R² = {r2_score(y_true_total, y_pred_total):.4f}, MAE = {mean_absolute_error(y_true_total, y_pred_total):.4f}")
+
+# --- Cleanup (optional) ---
 torch.distributed.destroy_process_group()
 
