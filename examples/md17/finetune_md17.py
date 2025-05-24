@@ -9,8 +9,8 @@ from sklearn.metrics import r2_score, mean_absolute_error
 import hydragnn
 
 # --- User Parameters ---
-split_dir = "qm9_splits"
-train_fraction = "100"
+split_dir = "md17_splits"
+train_fraction = "10"
 checkpoint_path = "gfm_0.229.pk"
 config_file = "config.json"
 
@@ -26,7 +26,7 @@ val_set = torch.load(os.path.join(split_dir, "val.pt"))
 test_set = torch.load(os.path.join(split_dir, "test.pt"))
 print(f"Loaded split: train_{train_fraction}.pt ({len(train_set)}), val ({len(val_set)}), test ({len(test_set)})")
 
-# --- Linear baseline normalization (residual training) ---
+# --- GFM-style linear baseline (used for residual training) ---
 all_splits = [train_set, val_set, test_set]
 all_elements = sorted({int(z) for split in all_splits for g in split for z in g.z.tolist()})
 element_to_idx = {z: i for i, z in enumerate(all_elements)}
@@ -41,22 +41,22 @@ X_train = np.stack([get_element_fractions(g) for g in train_set])
 y_train = np.array([g.y.item() for g in train_set])
 reg = LinearRegression().fit(X_train, y_train)
 
-# Subtract baseline from training targets
+# --- Subtract baseline for training (residual prediction) ---
 for split in all_splits:
     for g in split:
         baseline = reg.predict(get_element_fractions(g).reshape(1, -1))[0]
         g.y = torch.tensor(g.y.item() - baseline, dtype=torch.float32)
-print("Subtracted linear baseline from QM9 targets (residual training).")
+print("Applied GFM-style linear baseline subtraction (residual training).")
 
 # --- Dataloaders ---
 train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_set, batch_size=batch_size)
 test_loader = DataLoader(test_set, batch_size=batch_size)
 
-# --- HydraGNN setup ---
+# --- Setup ---
 os.environ.setdefault("SERIALIZED_DATA_PATH", os.getcwd())
 world_size, world_rank = hydragnn.utils.distributed.setup_ddp()
-log_name = f"qm9_gfm_{train_fraction}"
+log_name = f"md17_gfm_{train_fraction}"
 hydragnn.utils.setup_log(log_name)
 
 hydragnn.utils.update_config(config, train_loader, val_loader, test_loader)
@@ -80,12 +80,13 @@ if os.path.isfile(checkpoint_path):
 else:
     raise FileNotFoundError(f"No GFM checkpoint found at {checkpoint_path}")
 
-# --- Optimizer & Trainer ---
+# --- Optimizer & Scheduler ---
 optimizer = torch.optim.AdamW(model.parameters(), lr=config["NeuralNetwork"]["Training"]["Optimizer"]["learning_rate"])
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-5)
 writer = hydragnn.utils.get_summary_writer(log_name)
 hydragnn.utils.save_config(config, log_name)
 
+# --- Training ---
 hydragnn.train.train_validate_test(
     model,
     optimizer,
@@ -110,20 +111,24 @@ with torch.no_grad():
         pred = model(batch)
         if isinstance(pred, (list, tuple)):
             pred = pred[0]
-        y_pred.append(pred.view(-1).cpu().numpy())
-        y_true.append(batch.y.view(-1).cpu().numpy())
+        if isinstance(pred, list):
+            y_pred.append(torch.cat(pred, dim=0).cpu().numpy())
+        else:
+            y_pred.append(pred.cpu().numpy())
+        y_true.append(batch.y.cpu().numpy())
 
 y_true = np.concatenate(y_true)
 y_pred = np.concatenate(y_pred)
 
-# Add baseline back to predictions
+# --- Add baseline back to get total energy predictions ---
 X_test = np.stack([get_element_fractions(g) for g in test_set])
 baseline_test = reg.predict(X_test)
 
 y_true_total = y_true + baseline_test
 y_pred_total = y_pred + baseline_test
 
-print(f"GFM FT (QM9, total energy): R² = {r2_score(y_true_total, y_pred_total):.4f}, MAE = {mean_absolute_error(y_true_total, y_pred_total):.4f}")
+print(f"GFM (total energy): R² = {r2_score(y_true_total, y_pred_total):.4f}, MAE = {mean_absolute_error(y_true_total, y_pred_total):.4f}")
 
+# --- Cleanup (optional) ---
 torch.distributed.destroy_process_group()
 
