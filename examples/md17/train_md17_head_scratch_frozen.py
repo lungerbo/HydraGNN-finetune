@@ -141,7 +141,7 @@ if __name__ == "__main__":
     train_ds = normalize(torch.load(os.path.join(base, train_file)), mean, std)
     val_ds   = normalize(torch.load(os.path.join(base, "val.pt")),  mean, std)
     test_ds  = normalize(torch.load(os.path.join(base, "test.pt")), mean, std)
-    log(f"✅ Loaded datasets: {len(train_ds)} train | {len(val_ds)} val | {len(test_ds)} test")
+    log(f" Loaded datasets: {len(train_ds)} train | {len(val_ds)} val | {len(test_ds)} test")
 
     # loaders (+ y shape fix)
     bs = int(cfg["NeuralNetwork"]["Training"]["batch_size"])
